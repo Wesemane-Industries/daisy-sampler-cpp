@@ -35,11 +35,19 @@ git clone --recurse-submodules https://github.com/electro-smith/DaisyExamples ~/
 ## Flash
 
 ```bash
-
 export GCC_PATH=/path/to/gcc-arm-none-eabi-10.3-2021.10/bin && export PATH=$GCC_PATH:$PATH
+# if you are using stlink-v3 debug probe
+make clean; make; make program
+# or for debug 
+make clean; DEBUG=1 make; make program
+
+# if you are not using stlink-v3 debug probe, this guide explains flashing https://daisy.audio/tutorials/cpp-dev-env/
 ```
 
-If you are using ST-Link v3 there will be two devices one for the actual microcontroller and one for the
+### Logging
+
+If you are using ST-Link v3 and you uncommencted the `LOGG` define in [./src/main.cpp](./src/main.cpp)
+there will be two devices one for the actual microcontroller and one for the
 debug probe, the one for the debug probe only exists if a logger is initialized
 
 ```bash

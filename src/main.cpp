@@ -40,6 +40,8 @@ float sysSampleRate;
 bool record = false;
 bool play = false;
 
+bool error_blink = false;
+
 #ifdef LOGG
 auto logger = Logger<LOGGER_INTERNAL>();
 #endif
@@ -128,6 +130,22 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
     }
 }
 
+void ErrorBlink() {
+    static uint8_t count = 0;
+    for (;;) {
+        error_blink = !error_blink;
+        hardware.led1.Set(error_blink, 0.0f, 0.0f);  // onboard led indicates recording state
+        hardware.UpdateLeds();
+        System::Delay(200);
+        count++;
+        if (count == 6) {
+            // blink 3 times then pause 1 sec for sd card error
+            System::Delay(1000);
+            count = 0;
+        }
+    }
+}
+
 int GetNextFileIndex(const char *baseName, const char *extension) {
     DIR dir;
     FILINFO fno;
@@ -177,19 +195,19 @@ int main(void) {
 #ifdef LOGG
         logger.PrintLine("SD card initialization failed");
 #endif
-        return 1;
+        ErrorBlink();
     }
     if (fsi.Init(FatFSInterface::Config::MEDIA_SD) != FatFSInterface::Result::OK) {
 #ifdef LOGG
         logger.PrintLine("File system initialization failed");
 #endif
-        return 1;
+        ErrorBlink();
     }
     if (f_mount(&fsi.GetSDFileSystem(), "/", 1) != FR_OK) {
 #ifdef LOGG
         logger.PrintLine("File system mount failed");
 #endif
-        return 1;
+        ErrorBlink();
     }
 
     System::Delay(100);

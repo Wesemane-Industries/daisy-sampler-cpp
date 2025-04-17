@@ -1,194 +1,242 @@
-#include "daisysp.h"
+#include <cstring>  // For strcmp
+
 #include "daisy_pod.h"
+#include "daisysp.h"
 
-// from DaisyLGPL
-#include "reverbsc.h"
-#include "tone.h"
+// needed for sd writing
+#include "daisy_core.h"
+#include "fatfs.h"
+#include "ff.h"
+#include "util/wav_format.h"
 
-// Set max delay time to 0.75 of samplerate.
-#define MAX_DELAY static_cast<size_t>(48000 * 2.5f)
-#define REV 0
-#define DEL 1
-#define CRU 2
-
-
-using namespace daisysp;
 using namespace daisy;
+using namespace daisysp;
 
-static DaisyPod pod;
+// #define LOGG  // uncomment to start serial over USB Logger class
 
-static ReverbSc                                  rev;
-static DelayLine<float, MAX_DELAY> DSY_SDRAM_BSS dell;
-static DelayLine<float, MAX_DELAY> DSY_SDRAM_BSS delr;
-static Tone                                      tone;
-static Parameter deltime, cutoffParam, crushrate;
-int              mode = REV;
+/**
+    this code was adapted from https://github.com/willemOH/daisy_looper
+ */
 
-float currentDelay, feedback, delayTarget, cutoff;
+DaisyPod hardware;
 
-int   crushmod, crushcount;
-float crushsl, crushsr, drywet;
+SdmmcHandler sdcard;
+FatFSInterface fsi;
+WavWriter<16384> writer;  // 16-bit
+bool saved = true;
 
+FIL fp;
+bool stereo = true;
 
-//Helper functions
-void Controls();
+#define BUFFER_LENGTH (48000 * 349)  // 349.52 secs; 48k * 2 (stereo) * 2  (16-bit or 2 bytes per sample) = 192k/s
+int16_t DSY_SDRAM_BSS Buffer[BUFFER_LENGTH];
 
-void GetReverbSample(float &outl, float &outr, float inl, float inr);
+float bufferIndex = 0;
+size_t length = 0;
+uint32_t recordedLength;
 
-void GetDelaySample(float &outl, float &outr, float inl, float inr);
+float sysSampleRate;
 
-void GetCrushSample(float &outl, float &outr, float inl, float inr);
+bool record = false;
+bool play = false;
 
+#ifdef LOGG
+auto logger = Logger<LOGGER_INTERNAL>();
+#endif
 
-void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
+struct StereoPair {
+    float left;
+    float right;
+};
+
+float GetBufferValueInterpolated(float index) {
+    int32_t indexInt = static_cast<int32_t>(index);  // strips decimal
+    float indexFraction = index - indexInt;          // gets decimal
+
+    float currentChannel = s162f(Buffer[indexInt]);
+    float nextChannel = s162f(Buffer[indexInt + 2]);  // if currentChannel is left channel, nextChannel will be left channel. Same with right
+
+    // Linear interpolation (creating value halfway between samples)
+    float sig = currentChannel + (nextChannel - currentChannel) * indexFraction;
+
+    return {sig};
+}
+
+void SetBufferValue(uint32_t index, StereoPair signal) {
+    Buffer[index] = f2s16(signal.left);
+    Buffer[index + 1] = f2s16(signal.right);
+}
+
+/* adds given wav file to the buffer. Only supports 16bit PCM 48kHz.
+ * If Stereo samples are interleaved left then right.
+ * return 0: succesful, 1: file read failed, 2: invalid format, 3: file too large
+ */
+int SetSample(TCHAR *fname) {
+    UINT bytesread;
+    WAV_FormatTypeDef wav_data;
+
+    memset(Buffer, 0, BUFFER_LENGTH);
+
+    if (f_open(&fp, fname, (FA_OPEN_EXISTING | FA_READ)) == FR_OK) {
+        // Populate the WAV Info
+        if (f_read(&fp, (void *)&wav_data, sizeof(WAV_FormatTypeDef), &bytesread) != FR_OK) return 1;
+    } else
+        return 4;
+
+    if (wav_data.SampleRate != 48000 || wav_data.BitPerSample != 16) return 2;
+    if (wav_data.SubCHunk2Size > BUFFER_LENGTH || wav_data.NbrChannels > 2) return 3;
+    stereo = wav_data.NbrChannels == 2;
+
+    if (f_lseek(&fp, sizeof(WAV_FormatTypeDef)) != FR_OK) return 5;
+
+    if (f_read(&fp, Buffer, wav_data.SubCHunk2Size, &bytesread) != FR_OK) return 6;
+    length = bytesread / (wav_data.BitPerSample / 8) / (stereo ? 2 : 1);
+
+#ifdef LOGG
+    // shows if there is a discrepancy between the following values after sample load (if not the same, wavwriter.h needs the bugfix)
+    logger.PrintLine("SubCHunk2Size: %d", wav_data.SubCHunk2Size);
+    logger.PrintLine("Bytes read: %d", bytesread);
+#endif
+    f_close(&fp);
+    return 0;
+}
+
+void AudioCallback(AudioHandle::InterleavingInputBuffer in,
                    AudioHandle::InterleavingOutputBuffer out,
-                   size_t                                size)
-{
-    float outl, outr, inl, inr;
-
-    Controls();
-
-    //audio
-    for(size_t i = 0; i < size; i += 2)
-    {
-        inl = in[i];
-        inr = in[i + 1];
-
-        switch(mode)
-        {
-            case REV: GetReverbSample(outl, outr, inl, inr); break;
-            case DEL: GetDelaySample(outl, outr, inl, inr); break;
-            case CRU: GetCrushSample(outl, outr, inl, inr); break;
-            default: outl = outr = 0;
+                   size_t size) {
+    float left = 0;
+    float right = 0;
+    for (size_t i = 0; i < size; i += 2) {
+        if (record) {
+            SetBufferValue(bufferIndex * 2.0f, StereoPair{in[i], in[i + 1]});  //* 2 to access the buffer as if it contained single left and right channel structs
+            bufferIndex += 1.0f;
+            length = bufferIndex;
+            // wav writing
+            float sampleArray[2] = {in[i], in[i + 1]};
+            writer.Sample(sampleArray);
+        } else if (play) {
+            if (bufferIndex < length) {
+                right = GetBufferValueInterpolated(bufferIndex * 2.0f);
+                left = GetBufferValueInterpolated(bufferIndex * 2.0f + 1.0f);
+                bufferIndex += 1.0f;  // change to value other than 1 for different playback speed
+            } else {
+                bufferIndex = 0.0f;
+            }
         }
-
-        // left out
-        out[i] = outl;
-
-        // right out
-        out[i + 1] = outr;
+        out[i] = left + in[i];
+        out[i + 1] = right + in[i + 1];
     }
 }
 
-int main(void)
-{
-    // initialize pod hardware and oscillator daisysp module
-    float sample_rate;
+int GetNextFileIndex(const char *baseName, const char *extension) {
+    DIR dir;
+    FILINFO fno;
+    int maxIndex = 0;
 
-    //Inits and sample rate
-    pod.Init();
-    pod.SetAudioBlockSize(4);
-    sample_rate = pod.AudioSampleRate();
-    rev.Init(sample_rate);
-    dell.Init();
-    delr.Init();
-    tone.Init(sample_rate);
+    // Open the root directory
+    if (f_opendir(&dir, "/") == FR_OK) {
+        while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != 0) {
+            // Check if the file matches the pattern "baseNameX.extension"
+            if (strstr(fno.fname, baseName) == fno.fname) {
+                const char *numPart = fno.fname + strlen(baseName);
+                if (isdigit(numPart[0])) {
+                    int index = atoi(numPart);
+                    const char *extPart = numPart + std::to_string(index).length();
+                    if (strcmp(extPart, extension) == 0) {
+                        maxIndex = std::max(maxIndex, index);
+                    }
+                }
+            }
+        }
+        f_closedir(&dir);
+    }
+    return maxIndex == 0 ? 1 : maxIndex + 1;  // Start at 1 if no files exist
+}
 
-    //set parameters
-    deltime.Init(pod.knob1, sample_rate * .05, MAX_DELAY, deltime.LOGARITHMIC);
-    cutoffParam.Init(pod.knob1, 500, 20000, cutoffParam.LOGARITHMIC);
-    crushrate.Init(pod.knob2, 1, 50, crushrate.LOGARITHMIC);
+int main(void) {
+    // hardware initialize
+    hardware.Init();
 
-    //reverb parameters
-    rev.SetLpFreq(18000.0f);
-    rev.SetFeedback(0.85f);
+#ifdef LOGG
+    logger.StartLog(true);
+    logger.PrintLine("logging activated");
+#endif
 
-    //delay parameters
-    currentDelay = delayTarget = sample_rate * 0.75f;
-    dell.SetDelay(currentDelay);
-    delr.SetDelay(currentDelay);
+    // store audio settings
+    size_t blocksize = 4;
+    sysSampleRate = hardware.AudioSampleRate();
 
     // start callback
-    pod.StartAdc();
-    pod.StartAudio(AudioCallback);
+    hardware.SetAudioBlockSize(blocksize);
+    hardware.StartAudio(AudioCallback);
 
-    while(1) {}
-}
-
-void UpdateKnobs(float &k1, float &k2)
-{
-    k1 = pod.knob1.Process();
-    k2 = pod.knob2.Process();
-
-    switch(mode)
-    {
-        case REV:
-            drywet = k1;
-            rev.SetFeedback(k2);
-            break;
-        case DEL:
-            delayTarget = deltime.Process();
-            feedback    = k2;
-            break;
-        case CRU:
-            cutoff = cutoffParam.Process();
-            tone.SetFreq(cutoff);
-            crushmod = (int)crushrate.Process();
+    // mount sd card
+    SdmmcHandler::Config sd_cfg;
+    sd_cfg.Defaults();
+    if (sdcard.Init(sd_cfg) != SdmmcHandler::Result::OK) {
+#ifdef LOGG
+        logger.PrintLine("SD card initialization failed");
+#endif
+        return 1;
     }
-}
-
-void UpdateEncoder()
-{
-    mode = mode + pod.encoder.Increment();
-    mode = (mode % 3 + 3) % 3;
-}
-
-void UpdateLeds(float k1, float k2)
-{
-    pod.led1.Set(
-        k1 * (mode == 2), k1 * (mode == 1), k1 * (mode == 0 || mode == 2));
-    pod.led2.Set(
-        k2 * (mode == 2), k2 * (mode == 1), k2 * (mode == 0 || mode == 2));
-
-    pod.UpdateLeds();
-}
-
-void Controls()
-{
-    float k1, k2;
-    delayTarget = feedback = drywet = 0;
-
-    pod.ProcessAnalogControls();
-    pod.ProcessDigitalControls();
-
-    UpdateKnobs(k1, k2);
-
-    UpdateEncoder();
-
-    UpdateLeds(k1, k2);
-}
-
-void GetReverbSample(float &outl, float &outr, float inl, float inr)
-{
-    rev.Process(inl, inr, &outl, &outr);
-    outl = drywet * outl + (1 - drywet) * inl;
-    outr = drywet * outr + (1 - drywet) * inr;
-}
-
-void GetDelaySample(float &outl, float &outr, float inl, float inr)
-{
-    fonepole(currentDelay, delayTarget, .00007f);
-    delr.SetDelay(currentDelay);
-    dell.SetDelay(currentDelay);
-    outl = dell.Read();
-    outr = delr.Read();
-
-    dell.Write((feedback * outl) + inl);
-    outl = (feedback * outl) + ((1.0f - feedback) * inl);
-
-    delr.Write((feedback * outr) + inr);
-    outr = (feedback * outr) + ((1.0f - feedback) * inr);
-}
-
-void GetCrushSample(float &outl, float &outr, float inl, float inr)
-{
-    crushcount++;
-    crushcount %= crushmod;
-    if(crushcount == 0)
-    {
-        crushsr = inr;
-        crushsl = inl;
+    if (fsi.Init(FatFSInterface::Config::MEDIA_SD) != FatFSInterface::Result::OK) {
+#ifdef LOGG
+        logger.PrintLine("File system initialization failed");
+#endif
+        return 1;
     }
-    outl = tone.Process(crushsl);
-    outr = tone.Process(crushsr);
+    if (f_mount(&fsi.GetSDFileSystem(), "/", 1) != FR_OK) {
+#ifdef LOGG
+        logger.PrintLine("File system mount failed");
+#endif
+        return 1;
+    }
+
+    System::Delay(100);
+
+    // // read from sd card to buffer
+    // char sampleName[] = "loop.wav";
+    // int error = SetSample(sampleName);
+    // logger.PrintLine("setsample error: %d", error);
+
+    // intialze wavwriter
+    WavWriter<16384>::Config config;
+    config.samplerate = sysSampleRate;
+    config.channels = 2;
+    config.bitspersample = 16;
+    writer.Init(config);
+
+    // update loop
+    for (;;) {
+        hardware.ProcessDigitalControls();
+        hardware.led1.Set(hardware.button1.Pressed(), 0.0f, 0.0f);  // onboard led indicates recording state
+        hardware.UpdateLeds();
+
+        if (hardware.button1.Pressed()) {
+            record = true;
+            saved = false;
+            writer.Write();
+        } else {
+            record = false;
+        }
+
+        if (!record && !saved) {
+            writer.SaveFile();
+            recordedLength = writer.GetLengthSamps();
+            saved = true;
+        }
+
+        if (hardware.button1.RisingEdge()) {
+            char nextFileName[32];
+            int nextIndex = GetNextFileIndex("rec", ".wav");
+            snprintf(nextFileName, sizeof(nextFileName), "rec%d.wav", nextIndex);
+            writer.OpenFile(nextFileName);  // Open WAV file
+            bufferIndex = 0;
+        }
+
+        if (hardware.button2.RisingEdge()) {  // toggles playback
+            bufferIndex = 0;
+            play = !play;
+        }
+    }
 }

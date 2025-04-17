@@ -1,10 +1,21 @@
 # Project Name
-TARGET = daisy-effect-cpp
+TARGET = daisy-sampler-cpp
 
-USE_DAISYSP_LGPL = 1
+# Includes FatFS source files within project.
+USE_FATFS = 1
+
+LDFLAGS = -u _printf_float
 
 # Sources
 CPP_SOURCES = src/main.cpp
+# CPP_SOURCES = tests/fatfs_test.cpp
+# CPP_SOURCES = tests/bypass_test.cpp
+# CPP_SOURCES = tests/button_test.cpp
+# CPP_SOURCES = tests/raw_player.cpp
+# CPP_SOURCES = tests/looper_test.cpp
+# CPP_SOURCES = tests/wavwriter_test.cpp
+# CPP_SOURCES = tests/logger_test.cpp
+
 
 # Library Locations
 LIBDAISY_DIR = ../DaisyExamples/libDaisy/

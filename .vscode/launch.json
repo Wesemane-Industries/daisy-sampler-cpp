@@ -10,7 +10,7 @@
         "-d",
         "${workspaceRoot}"
       ],
-      "executable": "${workspaceRoot}/build/daisy-effect-cpp.elf",
+      "executable": "${workspaceRoot}/build/daisy-sampler-cpp.elf",
       "interface": "swd",
       "name": "Cortex Debug",
       "openOCDLaunchCommands": [
